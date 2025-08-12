@@ -48,15 +48,7 @@ The FLD module (`mod_fld.t`) implements the flux-limited diffusion approximation
    - `c`: Speed of light
 
 2. **Flux Limiter Function**
-   The radiation flux is computed as:
-   ```fortran
-   F_rad = -cλ(R)/(3κρ) ∇E_rad
-   ```
-   where λ(R) is the flux limiter that transitions between:
-   - Optically thick diffusion: λ = 1/3
-   - Free streaming: λ = 1/R
-   - R = |∇E_rad|/(κρE_rad) is the dimensionless gradient
-
+The radiation flux is computed as:
 ### Available Flux Limiters
 
 AMRVAC implements several flux limiter prescriptions:
@@ -173,7 +165,8 @@ fld_kappa = fld_kappa0/unit_opacity
 #### 2. Thomson Scattering (`'thomson'`)
 ```fortran
 sigma_thomson = 6.6524585d-25  ! cm²
-fld_kappa = sigma_thomson/m_p * (1+2*Y)/(1+4*Y)
+! X, Y are mass fractions of H and He; m_p is the proton mass; units: cm²/g
+fld_kappa = sigma_thomson/m_p * (X + 0.5*Y)
 ```
 - Pure electron scattering
 - Frequency-independent
@@ -319,10 +312,16 @@ AMRVAC implements three methods to solve the energy polynomial:
 
 ### Radiation Force
 
-The radiation force on matter is computed as:
+The radiation force density on matter is computed as (using the flux-mean opacity κ_F):
 
 ```fortran
-F_rad = (κρ/c) * F_rad
+f_rad = (κ_F*ρ/c) * F_rad
+```
+
+Equivalently, the radiation acceleration (force per unit mass) is:
+
+```fortran
+g_rad = (κ_F/c) * F_rad
 ```
 
 This force:
@@ -335,13 +334,14 @@ This force:
 The radiation diffusion coefficient in the FLD approximation:
 
 ```fortran
-D = c*λ/(3κρ)
+D = c*λ/(κ_R*ρ)
 ```
 
 This coefficient:
 - Controls the rate of radiation energy transport
-- Depends on both opacity and flux limiter
-- Transitions from D = c/(3κρ) in optically thick regions to D → c in optically thin regions
+- Depends on the Rosseland mean opacity κ_R and the flux limiter λ
+- In optically thick regions (R → 0), λ → 1/3 so D → c/(3 κ_R ρ)
+- In the free-streaming limit (R → ∞), the FLD flux saturates at |F| → c E_rad; D itself does not approach c
 
 ## Computational Workflow
 
@@ -425,7 +425,7 @@ Example configuration for Wolf-Rayet star:
 ```
 
 ### Accretion Disks
-
+In doc/radiation_opacity_deep_analysis.md around lines 141 to 152, the final conversion uses 10**logKappa_out which can promote single-precision; change the literal to a double-precision exponent base (e.g. 10.0d0**logKappa_out) to ensure the exponentiation is done in double precision and verify logKappa_out is a double-precision variable (real(kind=8)) so the result kappa is computed in DP.
 FLD with appropriate opacities can model:
 - **Disk vertical structure**: Radiation pressure support
 - **Thermal instabilities**: S-curve behavior
@@ -449,7 +449,7 @@ Simplified opacities for controlled experiments:
 &fld_list
   fld_opacity_law = 'const'
   fld_kappa0 = 0.34d0  ! cm²/g
-/
+/In doc/radiation_opacity_deep_analysis.md around lines 623 to 625, the metadata block contains external-tool branding and an out-of-date date; replace the three lines so they follow repo conventions (keep the version but update the date and remove "Technical Analysis by Claude"), e.g. set "Document Version: 1.0", update "Last Updated:" to the current repo-standard date (2025-08-12) and set "Author:" to the repository-conventional value (for example "Author: Project Team" or "Author: Repository Contributors").
 ```
 
 ## Advanced Features

@@ -31,6 +31,6 @@ doc/html/*
 .idea/
 *.npy
 /src/new_makefile
-CLAUDE.md
+/CLAUDE.md
 .DS_Store
-.claude/
+/.claude/
