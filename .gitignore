@@ -30,6 +30,8 @@ doc/html/*
 *.pyc
 .idea/
 *.npy
+*.egg-info/
+*.egg-link
 /src/new_makefile
 /CLAUDE.md
 .DS_Store

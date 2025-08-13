@@ -1,0 +1,22 @@
+&filelist
+  base_filename='./rhd_shock'
+  convert = .true.
+  convert_type = 'vtuCCmpi'
+  nwauxio = 0
+/
+
+&savelist
+  itsave(1,1) = 0
+  itsave(1,2) = 0
+/
+
+&stoplist
+  time_max = 10.d0
+/
+
+&methodlist
+  time_stepper = 'onestep'
+  time_integrator = 'IMEX_SP'
+  flux_scheme = 20*'hll'
+  limiter = 20*'minmod'
+/
