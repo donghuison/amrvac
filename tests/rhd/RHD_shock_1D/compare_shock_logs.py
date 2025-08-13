@@ -105,14 +105,19 @@ def compare_logs(test_log, ref_log):
         print(f"⚠️  Maximum relative difference: {max_rel_diff:.2E}%")
     print("="*60)
 
-# Compare with reference
-test_log = 'rhd_shock.log'
-ref_log = 'correct_output/rhd_shock.log'
+def main():
+    """Main function to run the log comparisons"""
+    # Compare with reference
+    test_log = 'rhd_shock.log'
+    ref_log = 'correct_output/rhd_shock.log'
+    
+    compare_logs(test_log, ref_log)
+    
+    # Also compare with IMEX_SP_tvdlf_ko variant if it exists
+    print("\n")
+    ref_log2 = 'correct_output/rhd_shock_IMEX_SP_tvdlf_ko.log'
+    print("Comparing with IMEX_SP_tvdlf_ko variant:")
+    compare_logs(test_log, ref_log2)
 
-compare_logs(test_log, ref_log)
-
-# Also compare with IMEX_SP_tvdlf_ko variant if it exists
-print("\n")
-ref_log2 = 'correct_output/rhd_shock_IMEX_SP_tvdlf_ko.log'
-print("Comparing with IMEX_SP_tvdlf_ko variant:")
-compare_logs(test_log, ref_log2)
+if __name__ == "__main__":
+    main()

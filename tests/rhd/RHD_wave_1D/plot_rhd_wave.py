@@ -5,6 +5,7 @@ Based on the physical parameters and expected wave pattern
 """
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
 import amrvac_pytools as apt
 
 def create_expected_visualization():
@@ -179,7 +180,6 @@ def main():
     print("\n=== Detailed Analysis ===")
     
     # Count wave periods
-    from scipy.signal import find_peaks
     peaks_rho, _ = find_peaks(rho - np.mean(rho))
     
     print(f"Number of density peaks: {len(peaks_rho)}")
@@ -189,7 +189,10 @@ def main():
         print(f"Average wavelength from peaks: {avg_wavelength:.2f}")
     
     # Phase velocity
-    phase_velocity = 2 * np.pi / (np.pi/10) / (2 * np.pi)  # ω/k
+    # omega = 2 * π / 20, k = π/10, so phase_velocity = omega / k
+    omega = 2 * np.pi / 20  # angular frequency
+    k = np.pi / 10  # wavenumber
+    phase_velocity = omega / k  # ω/k
     print(f"Phase velocity: c_phase = {phase_velocity:.2f}")
     
     # Summary statistics

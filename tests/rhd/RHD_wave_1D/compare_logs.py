@@ -11,7 +11,7 @@ def read_log_file(filename):
     with open(filename, 'r') as f:
         for line in f:
             # Skip comment lines
-            if line.startswith('#') or 'mean' in line:
+            if line.startswith('#'):
                 continue
             # Skip empty lines
             line = line.strip()
