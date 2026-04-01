@@ -92,9 +92,13 @@ module mod_twofl_phys
 
   !> Indices of the momentum density
   integer, allocatable, public :: mom_c(:)
+  !> Indices of the momentum density for the form of better vectorization
+  integer, public, protected   :: ^C&m^C_
 
   !> Index of the energy density (-1 if not present)
-  integer, public             :: e_c_=-1
+  integer, public              :: e_c_=-1
+  !> Indices of the magnetic field for the form of better vectorization
+  integer, public, protected   :: ^C&b^C_
 
   !> Index of the cutoff temperature for the TRAC method
   integer, public              :: Tcoff_c_
@@ -170,7 +174,7 @@ module mod_twofl_phys
   character(len=std_len), public, protected :: type_ct  = 'uct_contact'
 
   !> Whether divB is computed with a fourth order approximation
-  logical, public, protected :: twofl_divb_4thorder = .false.
+  integer, public, protected :: twofl_divb_nth = 1
 
   !> Method type in a integer for good performance
   integer :: type_divb
@@ -296,7 +300,7 @@ contains
       twofl_coll_inc_te, twofl_coll_inc_ionrec,&
       twofl_equi_thermal_n,dtcollpar,&
       twofl_dump_coll_terms,twofl_implicit_calc_mult_method,&
-      boundary_divbfix, boundary_divbfix_skip, twofl_divb_4thorder, &
+      boundary_divbfix, boundary_divbfix_skip, twofl_divb_nth, &
       clean_initial_divb,  &
       twofl_trac, twofl_trac_type, twofl_trac_mask,twofl_cbounds_species 
 
@@ -469,6 +473,17 @@ contains
       call mpistop('Unknown divB fix')
     end select
 
+    select case(type_ct)
+    case('average')
+      transverse_ghost_cells = 1
+    case('uct_contact')
+      transverse_ghost_cells = 1
+    case('uct_hll')
+      transverse_ghost_cells = 2
+    case default
+      call mpistop('choose average, uct_contact,or uct_hll for type_ct!')
+    end select
+
     allocate(start_indices(number_species))
     allocate(stop_indices(number_species))
     start_indices(1)=1
@@ -481,6 +496,7 @@ contains
     do idir=1,ndir
       mom_c(idir) = var_set_fluxvar("m_c","v_c",idir)
     enddo
+    m^C_=mom_c(^C);
 
     allocate(iw_mom(ndir))
     iw_mom(1:ndir) = mom_c(1:ndir)
@@ -496,6 +512,7 @@ contains
   ! ambipolar sts assumes mag and energy charges are continuous
     allocate(mag(ndir))
     mag(:) = var_set_bfield(ndir)
+    b^C_=mag(^C);
 
     if (twofl_glm) then
       psi_ = var_set_fluxvar('psi', 'psi', need_bc=.false.)
@@ -572,7 +589,7 @@ contains
     endif  
 
     ! set number of variables which need update ghostcells
-    nwgc=nwflux
+    nwgc=nwflux+nwaux
 
     ! determine number of stagger variables
     nws=ndim
@@ -631,8 +648,22 @@ contains
 
     ! if using ct stagger grid, boundary divb=0 is not done here
     if(stagger_grid) then
-      phys_get_ct_velocity => twofl_get_ct_velocity
-      phys_update_faces => twofl_update_faces
+      select case(type_ct)
+      case('average')
+        transverse_ghost_cells = 1
+        phys_get_ct_velocity => twofl_get_ct_velocity_average
+        phys_update_faces => twofl_update_faces_average
+      case('uct_contact')
+        transverse_ghost_cells = 1
+        phys_get_ct_velocity => twofl_get_ct_velocity_contact
+        phys_update_faces => twofl_update_faces_contact
+      case('uct_hll')
+        transverse_ghost_cells = 2
+        phys_get_ct_velocity => twofl_get_ct_velocity_hll
+        phys_update_faces => twofl_update_faces_hll
+      case default
+        call mpistop('choose average, uct_contact,or uct_hll for type_ct!')
+      end select
       phys_face_to_center => twofl_face_to_center
       phys_modify_wLR => twofl_modify_wLR
     else if(ndim>1) then
@@ -643,9 +674,6 @@ contains
     ! clean initial divb
     if(clean_initial_divb) phys_clean_divb => twofl_clean_divb_multigrid
     }
-
-    ! Whether diagonal ghost cells are required for the physics
-    if(type_divb < divb_linde) phys_req_diagonal = .false.
 
     ! derive units from basic units
     call twofl_physical_units()
@@ -658,7 +686,6 @@ contains
     ! initialize thermal conduction module
     if (twofl_thermal_conduction_c &
         .or. twofl_thermal_conduction_n) then
-      phys_req_diagonal = .true.
       call sts_init()
       call tc_init_params(twofl_gamma)
     endif
@@ -788,7 +815,7 @@ contains
 
     ! Initialize viscosity module
     !!TODO
-    !if (twofl_viscosity) call viscosity_init(phys_wider_stencil,phys_req_diagonal)
+    !if (twofl_viscosity) call viscosity_init(phys_wider_stencil)
 
     ! Initialize gravity module
     if(twofl_gravity) then
@@ -801,7 +828,6 @@ contains
     ! in getflux: assuming one additional ghost layer (two for FOURTHORDER) was
     ! added in nghostcells.
     if (twofl_hall) then
-       phys_req_diagonal = .true.
        if (twofl_4th_order) then
           phys_wider_stencil = 2
        else
@@ -1328,7 +1354,6 @@ contains
   subroutine twofl_physical_units()
     use mod_global_parameters
     double precision :: mp,kB,miu0,c_lightspeed
-    !double precision :: a,b,c,d
     double precision :: a,b
     ! Derive scaling units
     if(SI_unit) then
@@ -1347,39 +1372,83 @@ contains
     b=1d0
     Rc=2d0
     Rn=1d0  
-
-    !now the unit choice:
-    !unit 1 from number density or density -> mH
-    !unit 2 from 
-
-    if(unit_density/=1.d0) then
-      unit_numberdensity=unit_density/(a*mp)
-    else
-      ! unit of numberdensity is independent by default
-      unit_density=a*mp*unit_numberdensity
-    end if
-    if(unit_velocity/=1.d0) then
-      unit_pressure=unit_density*unit_velocity**2
-      unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
-      unit_magneticfield=sqrt(miu0*unit_pressure)
-    else if(unit_pressure/=1.d0) then
-      unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
-      unit_velocity=sqrt(unit_pressure/unit_density)
-      unit_magneticfield=sqrt(miu0*unit_pressure)
-    else if(unit_magneticfield/=1.d0) then
-      unit_pressure=unit_magneticfield**2/miu0
-      unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
-      unit_velocity=sqrt(unit_pressure/unit_density)
+    ! assume unit_length is alway specified
+    if(unit_density/=1.d0 .or. unit_numberdensity/=1.d0) then
+      if(unit_density/=1.d0) then
+        unit_numberdensity=unit_density/(a*mp)
+      else if(unit_numberdensity/=1.d0) then
+        unit_density=a*mp*unit_numberdensity
+      end if
+      if(unit_temperature/=1.d0) then
+        unit_pressure=b*unit_numberdensity*kB*unit_temperature
+        unit_velocity=sqrt(unit_pressure/unit_density)
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_time=unit_length/unit_velocity
+      else if(unit_magneticfield/=1.d0) then
+        unit_pressure=unit_magneticfield**2/miu0
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+        unit_velocity=sqrt(unit_pressure/unit_density)
+        unit_time=unit_length/unit_velocity
+      else if(unit_pressure/=1.d0) then
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+        unit_velocity=sqrt(unit_pressure/unit_density)
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_time=unit_length/unit_velocity
+      else if(unit_velocity/=1.d0) then
+        unit_pressure=unit_density*unit_velocity**2
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_time=unit_length/unit_velocity
+      else if(unit_time/=1.d0) then
+        unit_velocity=unit_length/unit_time
+        unit_pressure=unit_density*unit_velocity**2
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+      end if
     else if(unit_temperature/=1.d0) then
-      unit_pressure=b*unit_numberdensity*kB*unit_temperature
-      unit_velocity=sqrt(unit_pressure/unit_density)
-      unit_magneticfield=sqrt(miu0*unit_pressure)
-    end if
-    if(unit_time/=1.d0) then
-      unit_length=unit_time*unit_velocity
-    else
-      ! unit of length is independent by default
-      unit_time=unit_length/unit_velocity
+      ! units of temperature and velocity are dependent
+      if(unit_magneticfield/=1.d0) then
+        unit_pressure=unit_magneticfield**2/miu0
+        unit_numberdensity=unit_pressure/(b*unit_temperature*kB)
+        unit_density=a*mp*unit_numberdensity
+        unit_velocity=sqrt(unit_pressure/unit_density)
+        unit_time=unit_length/unit_velocity
+      else if(unit_pressure/=1.d0) then
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_numberdensity=unit_pressure/(b*unit_temperature*kB)
+        unit_density=a*mp*unit_numberdensity
+        unit_velocity=sqrt(unit_pressure/unit_density)
+        unit_time=unit_length/unit_velocity
+      end if
+    else if(unit_magneticfield/=1.d0) then
+      ! units of magnetic field and pressure are dependent
+      if(unit_velocity/=1.d0) then
+        unit_pressure=unit_magneticfield**2/miu0
+        unit_numberdensity=unit_pressure/(b*unit_temperature*kB)
+        unit_density=a*mp*unit_numberdensity
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+        unit_time=unit_length/unit_velocity
+      else if(unit_time/=0.d0) then
+        unit_pressure=unit_magneticfield**2/miu0
+        unit_velocity=unit_length/unit_time
+        unit_density=unit_pressure/unit_velocity**2
+        unit_numberdensity=unit_density/(a*mp)
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+      end if
+    else if(unit_pressure/=1.d0) then
+      if(unit_velocity/=1.d0) then
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_density=unit_pressure/unit_velocity**2
+        unit_numberdensity=unit_density/(a*mp)
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+        unit_time=unit_length/unit_velocity
+      else if(unit_time/=0.d0) then
+        unit_magneticfield=sqrt(miu0*unit_pressure)
+        unit_velocity=unit_length/unit_time
+        unit_density=unit_pressure/unit_velocity**2
+        unit_numberdensity=unit_density/(a*mp)
+        unit_temperature=unit_pressure/(b*unit_numberdensity*kB)
+      end if
     end if
     ! Additional units needed for the particles
     c_norm=c_lightspeed/unit_velocity
@@ -1760,19 +1829,26 @@ contains
     use mod_global_parameters
 
     integer, intent(in)          :: ixI^L, ixO^L, idim
+    ! w in primitive form
     double precision, intent(in) :: w(ixI^S, nw), x(ixI^S,1:ndim)
     double precision, intent(inout) :: cmax(ixI^S)
-    double precision                :: vc(ixI^S)
-    double precision                :: cmax2(ixI^S)
-    double precision                :: vn(ixI^S)
+    double precision                :: cmax2(ixI^S),rhon(ixI^S)
 
     call twofl_get_csound_c_idim(w,x,ixI^L,ixO^L,idim,cmax)
-    call twofl_get_v_c_idim(w,x,ixI^L,ixO^L,idim,vc)
-    call twofl_get_v_n_idim(w,x,ixI^L,ixO^L,idim,vn)
-    call twofl_get_csound_n(w,x,ixI^L,ixO^L,cmax2)
-    cmax(ixO^S)=max(abs(vn(ixO^S))+cmax2(ixO^S),& 
-            abs(vc(ixO^S))+cmax(ixO^S))
-        
+    call get_rhon_tot(w,x,ixI^L,ixO^L,rhon)
+    if(phys_energy) then
+      if(has_equi_pe_n0) then
+        cmax2(ixO^S)=sqrt(twofl_gamma*(w(ixO^S,e_n_)+&
+            block%equi_vars(ixO^S,equi_pe_n0_,b0i))/rhon(ixO^S))
+      else
+        cmax2(ixO^S)=sqrt(twofl_gamma*w(ixO^S,e_n_)/rhon(ixO^S))
+      end if
+    else
+      cmax2(ixO^S)=sqrt(twofl_gamma*twofl_adiab*rhon(ixO^S)**gamma_1)
+    end if
+    cmax(ixO^S)=max(abs(w(ixO^S,mom_n(idim)))+cmax2(ixO^S),& 
+            abs(w(ixO^S,mom_c(idim)))+cmax(ixO^S))
+
   end subroutine twofl_get_cmax
 
   subroutine twofl_get_a2max(w,x,ixI^L,ixO^L,a2max)
@@ -2406,11 +2482,9 @@ contains
 
     case (2)
     ! typeboundspeed=='cmaxmean'
-      wmean(ixO^S,1:nwflux)=0.5d0*(wLC(ixO^S,1:nwflux)+wRC(ixO^S,1:nwflux))
+      wmean(ixO^S,1:nwflux)=0.5d0*(wLp(ixO^S,1:nwflux)+wRp(ixO^S,1:nwflux))
      ! charges 
-
-      call get_rhoc_tot(wmean,x,ixI^L,ixO^L,rho)
-      tmp1(ixO^S)=wmean(ixO^S,mom_c(idim))/rho(ixO^S)
+      tmp1(ixO^S)=wmean(ixO^S,mom_c(idim))
       call twofl_get_csound_c_idim(wmean,x,ixI^L,ixO^L,idim,csoundR)
       if(present(cmin)) then
         cmax(ixO^S,1)=max(abs(tmp1(ixO^S))+csoundR(ixO^S),zero)
@@ -2426,8 +2500,7 @@ contains
       end if
       !neutrals
       
-      call get_rhon_tot(wmean,x,ixI^L,ixO^L,rho)
-      tmp1(ixO^S)=wmean(ixO^S,mom_n(idim))/rho(ixO^S)
+      tmp1(ixO^S)=wmean(ixO^S,mom_n(idim))
       call twofl_get_csound_n(wmean,x,ixI^L,ixO^L,csoundR)
       if(present(cmin)) then
         cmax(ixO^S,2)=max(abs(tmp1(ixO^S))+csoundR(ixO^S),zero)
@@ -2479,7 +2552,33 @@ contains
   end subroutine twofl_get_cbounds_species
 
   !> prepare velocities for ct methods
-  subroutine twofl_get_ct_velocity(vcts,wLp,wRp,ixI^L,ixO^L,idim,cmax,cmin)
+  subroutine twofl_get_ct_velocity_average(vcts,wLp,wRp,ixI^L,ixO^L,idim,cmax,cmin)
+    use mod_global_parameters
+
+    integer, intent(in)             :: ixI^L, ixO^L, idim
+    double precision, intent(in)    :: wLp(ixI^S, nw), wRp(ixI^S, nw)
+    double precision, intent(in)    :: cmax(ixI^S)
+    double precision, intent(in), optional :: cmin(ixI^S)
+    type(ct_velocity), intent(inout):: vcts
+
+  end subroutine twofl_get_ct_velocity_average
+
+  subroutine twofl_get_ct_velocity_contact(vcts,wLp,wRp,ixI^L,ixO^L,idim,cmax,cmin)
+    use mod_global_parameters
+
+    integer, intent(in)             :: ixI^L, ixO^L, idim
+    double precision, intent(in)    :: wLp(ixI^S, nw), wRp(ixI^S, nw)
+    double precision, intent(in)    :: cmax(ixI^S)
+    double precision, intent(in), optional :: cmin(ixI^S)
+    type(ct_velocity), intent(inout):: vcts
+
+    if(.not.allocated(vcts%vnorm)) allocate(vcts%vnorm(ixI^S,1:ndim))
+    ! get average normal velocity at cell faces
+    vcts%vnorm(ixO^S,idim)=0.5d0*(wLp(ixO^S,mom_c(idim))+wRp(ixO^S,mom_c(idim)))
+
+  end subroutine twofl_get_ct_velocity_contact
+
+  subroutine twofl_get_ct_velocity_hll(vcts,wLp,wRp,ixI^L,ixO^L,idim,cmax,cmin)
     use mod_global_parameters
 
     integer, intent(in)             :: ixI^L, ixO^L, idim
@@ -2490,51 +2589,41 @@ contains
 
     integer                         :: idimE,idimN
 
-    ! calculate velocities related to different UCT schemes
-    select case(type_ct)
-    case('average')
-    case('uct_contact')
-      if(.not.allocated(vcts%vnorm)) allocate(vcts%vnorm(ixI^S,1:ndim))
-      ! get average normal velocity at cell faces
-      vcts%vnorm(ixO^S,idim)=0.5d0*(wLp(ixO^S,mom_c(idim))+wRp(ixO^S,mom_c(idim)))
-    case('uct_hll')
-      if(.not.allocated(vcts%vbarC)) then
-        allocate(vcts%vbarC(ixI^S,1:ndir,2),vcts%vbarLC(ixI^S,1:ndir,2),vcts%vbarRC(ixI^S,1:ndir,2))
-        allocate(vcts%cbarmin(ixI^S,1:ndim),vcts%cbarmax(ixI^S,1:ndim)) 
-      end if
-      ! Store magnitude of characteristics
-      if(present(cmin)) then
-        vcts%cbarmin(ixO^S,idim)=max(-cmin(ixO^S),zero)
-        vcts%cbarmax(ixO^S,idim)=max( cmax(ixO^S),zero)
-      else
-        vcts%cbarmax(ixO^S,idim)=max( cmax(ixO^S),zero)
-        vcts%cbarmin(ixO^S,idim)=vcts%cbarmax(ixO^S,idim)
-      end if
+    if(.not.allocated(vcts%vbarC)) then
+      allocate(vcts%vbarC(ixI^S,1:ndir,2),vcts%vbarLC(ixI^S,1:ndir,2),vcts%vbarRC(ixI^S,1:ndir,2))
+      allocate(vcts%cbarmin(ixI^S,1:ndim),vcts%cbarmax(ixI^S,1:ndim)) 
+    end if
+    ! Store magnitude of characteristics
+    if(present(cmin)) then
+      vcts%cbarmin(ixO^S,idim)=max(-cmin(ixO^S),zero)
+      vcts%cbarmax(ixO^S,idim)=max( cmax(ixO^S),zero)
+    else
+      vcts%cbarmax(ixO^S,idim)=max( cmax(ixO^S),zero)
+      vcts%cbarmin(ixO^S,idim)=vcts%cbarmax(ixO^S,idim)
+    end if
 
-      idimN=mod(idim,ndir)+1 ! 'Next' direction
-      idimE=mod(idim+1,ndir)+1 ! Electric field direction
-      ! Store velocities
-      vcts%vbarLC(ixO^S,idim,1)=wLp(ixO^S,mom_c(idimN))
-      vcts%vbarRC(ixO^S,idim,1)=wRp(ixO^S,mom_c(idimN))
-      vcts%vbarC(ixO^S,idim,1)=(vcts%cbarmax(ixO^S,idim)*vcts%vbarLC(ixO^S,idim,1) &
-           +vcts%cbarmin(ixO^S,idim)*vcts%vbarRC(ixO^S,idim,1))&
-          /(vcts%cbarmax(ixO^S,idim)+vcts%cbarmin(ixO^S,idim))
+    idimN=mod(idim,ndir)+1 ! 'Next' direction
+    idimE=mod(idim+1,ndir)+1 ! Electric field direction
+    ! Store velocities
+    vcts%vbarLC(ixO^S,idim,1)=wLp(ixO^S,mom_c(idimN))
+    vcts%vbarRC(ixO^S,idim,1)=wRp(ixO^S,mom_c(idimN))
+    vcts%vbarC(ixO^S,idim,1)=(vcts%cbarmax(ixO^S,idim)*vcts%vbarLC(ixO^S,idim,1) &
+         +vcts%cbarmin(ixO^S,idim)*vcts%vbarRC(ixO^S,idim,1))&
+        /(vcts%cbarmax(ixO^S,idim)+vcts%cbarmin(ixO^S,idim))
 
-      vcts%vbarLC(ixO^S,idim,2)=wLp(ixO^S,mom_c(idimE))
-      vcts%vbarRC(ixO^S,idim,2)=wRp(ixO^S,mom_c(idimE))
-      vcts%vbarC(ixO^S,idim,2)=(vcts%cbarmax(ixO^S,idim)*vcts%vbarLC(ixO^S,idim,2) &
-           +vcts%cbarmin(ixO^S,idim)*vcts%vbarRC(ixO^S,idim,1))&
-          /(vcts%cbarmax(ixO^S,idim)+vcts%cbarmin(ixO^S,idim))
-    case default
-      call mpistop('choose average, uct_contact,or uct_hll for type_ct!')
-    end select
+    vcts%vbarLC(ixO^S,idim,2)=wLp(ixO^S,mom_c(idimE))
+    vcts%vbarRC(ixO^S,idim,2)=wRp(ixO^S,mom_c(idimE))
+    vcts%vbarC(ixO^S,idim,2)=(vcts%cbarmax(ixO^S,idim)*vcts%vbarLC(ixO^S,idim,2) &
+         +vcts%cbarmin(ixO^S,idim)*vcts%vbarRC(ixO^S,idim,1))&
+        /(vcts%cbarmax(ixO^S,idim)+vcts%cbarmin(ixO^S,idim))
 
-  end subroutine twofl_get_ct_velocity
+  end subroutine twofl_get_ct_velocity_hll
 
   subroutine twofl_get_csound_c_idim(w,x,ixI^L,ixO^L,idim,csound)
     use mod_global_parameters
 
     integer, intent(in)          :: ixI^L, ixO^L, idim
+    ! w in primitive form
     double precision, intent(in) :: w(ixI^S, nw), x(ixI^S,1:ndim)
     double precision, intent(out):: csound(ixI^S)
     double precision :: cfast2(ixI^S), AvMinCs2(ixI^S), b2(ixI^S), kmax
@@ -2551,7 +2640,11 @@ contains
     inv_rho(ixO^S)=1.d0/tmp(ixO^S)
 #endif
 
-    call twofl_get_csound2_c_from_conserved(w,x,ixI^L,ixO^L,csound)
+    if(phys_energy) then 
+      csound(ixO^S)=twofl_gamma*w(ixO^S,e_c_)*inv_rho(ixO^S)
+    else
+      csound(ixO^S)=twofl_gamma*twofl_adiab*tmp(ixO^S)**gamma_1
+    end if
 
     ! store |B|^2 in v
     b2(ixO^S) = twofl_mag_en_all(w,ixI^L,ixO^L)
@@ -3405,7 +3498,6 @@ contains
   subroutine add_geom_PdivV(qdt,ixI^L,ixO^L,v,p,w,x,ind)
     use mod_global_parameters
     use mod_geometry
-
     integer, intent(in)             :: ixI^L, ixO^L,ind
     double precision, intent(in)    :: qdt
     double precision, intent(in)    :: p(ixI^S), v(ixI^S,1:ndir), x(ixI^S,1:ndim)
@@ -3414,9 +3506,9 @@ contains
 
     if(slab_uniform) then
       if(nghostcells .gt. 2) then
-        call divvector(v,ixI^L,ixO^L,divv,sixthorder=.true.)
+        call divvector(v,ixI^L,ixO^L,divv,3)
       else
-        call divvector(v,ixI^L,ixO^L,divv,fourthorder=.true.)
+        call divvector(v,ixI^L,ixO^L,divv,2)
       end if
     else
      call divvector(v,ixI^L,ixO^L,divv)
@@ -4130,7 +4222,7 @@ contains
     double precision :: gradPsi(ixI^S)
 
     ! We calculate now div B
-    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_4thorder)
+    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_nth)
 
     ! dPsi/dt =  - Ch^2/Cp^2 Psi
     if (twofl_glm_alpha < zero) then
@@ -4151,7 +4243,7 @@ contains
        case("central")
           call gradient(wCT(ixI^S,psi_),ixI^L,ixO^L,idim,gradPsi)
        case("limited")
-          call gradientS(wCT(ixI^S,psi_),ixI^L,ixO^L,idim,gradPsi)
+          call gradientL(wCT(ixI^S,psi_),ixI^L,ixO^L,idim,gradPsi)
        end select
        if (phys_total_energy) then
        ! e  = e  -qdt (b . grad(Psi))
@@ -4179,7 +4271,7 @@ contains
     integer                         :: idir
 
     ! We calculate now div B
-    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_4thorder)
+    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_nth)
 
     ! calculate velocity
     call twofl_get_v_c(wCT,x,ixI^L,ixO^L,v)
@@ -4216,7 +4308,7 @@ contains
     integer                         :: idir
 
     ! We calculate now div B
-    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_4thorder)
+    call get_divb(wCT,ixI^L,ixO^L,divb, twofl_divb_nth)
 
     ! b = b - qdt v * div b
     do idir=1,ndir
@@ -4242,7 +4334,7 @@ contains
 
     ! Calculate div B
     ixp^L=ixO^L^LADD1;
-    call get_divb(wCT,ixI^L,ixp^L,divb, twofl_divb_4thorder)
+    call get_divb(wCT,ixI^L,ixp^L,divb, twofl_divb_nth)
 
     ! for AMR stability, retreat one cell layer from the boarders of level jump
     {do i^DB=-1,1\}
@@ -4279,7 +4371,7 @@ contains
        case("central")
          call gradient(divb,ixI^L,ixp^L,idim,graddivb)
        case("limited")
-         call gradientS(divb,ixI^L,ixp^L,idim,graddivb)
+         call gradientL(divb,ixI^L,ixp^L,idim,graddivb)
        end select
 
        ! Multiply by Linde's eta*dt = divbdiff*(c_max*dx)*dt = divbdiff*dx**2
@@ -4553,13 +4645,13 @@ contains
   end subroutine coll_get_dt
 
   ! Add geometrical source terms to w
-  subroutine twofl_add_source_geom(qdt,dtfactor,ixI^L,ixO^L,wCT,w,x)
+  subroutine twofl_add_source_geom(qdt,dtfactor,ixI^L,ixO^L,wCT,wprim,w,x)
     use mod_global_parameters
     use mod_geometry
 
     integer, intent(in)             :: ixI^L, ixO^L
     double precision, intent(in)    :: qdt, dtfactor,x(ixI^S,1:ndim)
-    double precision, intent(inout) :: wCT(ixI^S,1:nw), w(ixI^S,1:nw)
+    double precision, intent(inout) :: wCT(ixI^S,1:nw), wprim(ixI^S,1:nw), w(ixI^S,1:nw)
 
     integer          :: iw,idir, h1x^L{^NOONED, h2x^L}
     double precision :: tmp(ixI^S),tmp1(ixI^S),tmp2(ixI^S),rho(ixI^S)
@@ -5469,7 +5561,7 @@ contains
        ^D&dxlevel(^D)=rnode(rpdx^D_,igrid);
 
        call get_divb(ps(igrid)%w(ixG^T, 1:nw), ixG^LL, ixM^LL, tmp, &
-            twofl_divb_4thorder)
+            twofl_divb_nth)
        mg%boxes(id)%cc({1:nc}, mg_irhs) = tmp(ixM^T)
        max_divb = max(max_divb, maxval(abs(tmp(ixM^T))))
     end do
@@ -5522,7 +5614,7 @@ contains
          do idim =1, ndim
            ixCmin^D=ixMlo^D-kr(idim,^D);
            ixCmax^D=ixMhi^D;
-           call gradientx(tmp,ps(igrid)%x,ixG^LL,ixC^L,idim,grad(ixG^T,idim),.false.)
+           call gradientF(tmp,ps(igrid)%x,ixG^LL,ixC^L,idim,grad(ixG^T,idim))
            ! Apply the correction B* = B - gradient(phi)
            ps(igrid)%ws(ixC^S,idim)=ps(igrid)%ws(ixC^S,idim)-grad(ixC^S,idim)
          end do
@@ -5554,85 +5646,56 @@ contains
 
   end subroutine twofl_clean_divb_multigrid
   }
-
-  subroutine twofl_update_faces(ixI^L,ixO^L,qt,qdt,wprim,fC,fE,sCT,s,vcts)
+  !> get electric field though averaging neighors to update faces in CT
+  subroutine twofl_update_faces_average(ixI^L,ixO^L,qt,qdt,wp,fC,fE,sCT,s,vcts)
     use mod_global_parameters
+    use mod_usr_methods
 
     integer, intent(in)                :: ixI^L, ixO^L
     double precision, intent(in)       :: qt,qdt
     ! cell-center primitive variables
-    double precision, intent(in)       :: wprim(ixI^S,1:nw)
+    double precision, intent(in)       :: wp(ixI^S,1:nw)
     type(state)                        :: sCT, s
     type(ct_velocity)                  :: vcts
     double precision, intent(in)       :: fC(ixI^S,1:nwflux,1:ndim)
     double precision, intent(inout)    :: fE(ixI^S,sdim:3)
 
-    select case(type_ct)
-    case('average')
-      call update_faces_average(ixI^L,ixO^L,qt,qdt,fC,fE,sCT,s)
-    case('uct_contact')
-      call update_faces_contact(ixI^L,ixO^L,qt,qdt,wprim,fC,fE,sCT,s,vcts)
-    case('uct_hll')
-      call update_faces_hll(ixI^L,ixO^L,qt,qdt,fE,sCT,s,vcts)
-    case default
-      call mpistop('choose average, uct_contact,or uct_hll for type_ct!')
-    end select
-
-  end subroutine twofl_update_faces
-
-  !> get electric field though averaging neighors to update faces in CT
-  subroutine update_faces_average(ixI^L,ixO^L,qt,qdt,fC,fE,sCT,s)
-    use mod_global_parameters
-    use mod_usr_methods
-
-    integer, intent(in)                :: ixI^L, ixO^L
-    double precision, intent(in)       :: qt, qdt
-    type(state)                        :: sCT, s
-    double precision, intent(in)       :: fC(ixI^S,1:nwflux,1:ndim)
-    double precision, intent(inout)    :: fE(ixI^S,sdim:3)
-
-    integer                            :: hxC^L,ixC^L,jxC^L,ixCm^L
-    integer                            :: idim1,idim2,idir,iwdim1,iwdim2
     double precision                   :: circ(ixI^S,1:ndim)
     ! non-ideal electric field on cell edges
-    double precision, dimension(ixI^S,sdim:3) :: E_resi
+    double precision, dimension(ixI^S,sdim:3) :: E_resi, E_ambi
+    integer                            :: ix^D,ixC^L,ixA^L,i1kr^D,i2kr^D
+    integer                            :: idim1,idim2,idir,iwdim1,iwdim2
 
     associate(bfaces=>s%ws,x=>s%x)
 
     ! Calculate contribution to FEM of each edge,
     ! that is, estimate value of line integral of
     ! electric field in the positive idir direction.
-    ixCmax^D=ixOmax^D;
-    ixCmin^D=ixOmin^D-1;
 
     ! if there is resistivity, get eta J
-    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,sCT,s,E_resi)
+    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,wp,sCT,s,E_resi)
 
-    fE=zero
-
-    do idim1=1,ndim 
+    do idim1=1,ndim
       iwdim1 = mag(idim1)
+      i1kr^D=kr(idim1,^D);
       do idim2=1,ndim
         iwdim2 = mag(idim2)
+        i2kr^D=kr(idim2,^D);
         do idir=sdim,3! Direction of line integral
           ! Allow only even permutations
           if (lvc(idim1,idim2,idir)==1) then
-            ! Assemble indices
-            jxC^L=ixC^L+kr(idim1,^D);
-            hxC^L=ixC^L+kr(idim2,^D);
-            ! Interpolate to edges
-            fE(ixC^S,idir)=quarter*(fC(ixC^S,iwdim1,idim2)+fC(jxC^S,iwdim1,idim2)&
-                                   -fC(ixC^S,iwdim2,idim1)-fC(hxC^S,iwdim2,idim1))
-
-            ! add resistive electric field at cell edges E=-vxB+eta J
-            if(twofl_eta/=zero) fE(ixC^S,idir)=fE(ixC^S,idir)+E_resi(ixC^S,idir)
-            fE(ixC^S,idir)=qdt*s%dsC(ixC^S,idir)*fE(ixC^S,idir)
-
-            if (.not.slab) then
-              where(abs(x(ixC^S,r_)+half*dxlevel(r_))<1.0d-9)
-                fE(ixC^S,idir)=zero
-              end where
-            end if
+            ixCmax^D=ixOmax^D;
+            ixCmin^D=ixOmin^D+kr(idir,^D)-1;
+            ! average cell-face electric field to cell edges
+           {do ix^DB=ixCmin^DB,ixCmax^DB\}
+              fE(ix^D,idir)=quarter*&
+                (fC(ix^D,iwdim1,idim2)+fC({ix^D+i1kr^D},iwdim1,idim2)&
+                -fC(ix^D,iwdim2,idim1)-fC({ix^D+i2kr^D},iwdim2,idim1))
+              ! add resistive electric field at cell edges E=-vxB+eta J
+              if(twofl_eta/=zero) fE(ix^D,idir)=fE(ix^D,idir)+E_resi(ix^D,idir)
+              ! times time step and edge length
+              fE(ix^D,idir)=fE(ix^D,idir)*qdt*s%dsC(ix^D,idir)
+           {end do\}
           end if
         end do
       end do
@@ -5645,42 +5708,44 @@ contains
     circ(ixI^S,1:ndim)=zero
 
     ! Calculate circulation on each face
-
-    do idim1=1,ndim ! Coordinate perpendicular to face 
-      do idim2=1,ndim
-        do idir=sdim,3 ! Direction of line integral
-          ! Assemble indices
-          hxC^L=ixC^L-kr(idim2,^D);
-          ! Add line integrals in direction idir
-          circ(ixC^S,idim1)=circ(ixC^S,idim1)&
-                           +lvc(idim1,idim2,idir)&
-                           *(fE(ixC^S,idir)&
-                            -fE(hxC^S,idir))
-        end do
-      end do
-    end do
-
-    ! Divide by the area of the face to get dB/dt
-    do idim1=1,ndim
+    do idim1=1,ndim ! Coordinate perpendicular to face
       ixCmax^D=ixOmax^D;
       ixCmin^D=ixOmin^D-kr(idim1,^D);
-      where(s%surfaceC(ixC^S,idim1) > 1.0d-9*s%dvolume(ixC^S))
-        circ(ixC^S,idim1)=circ(ixC^S,idim1)/s%surfaceC(ixC^S,idim1)
-      elsewhere
-        circ(ixC^S,idim1)=zero
-      end where
-      ! Time update
-      bfaces(ixC^S,idim1)=bfaces(ixC^S,idim1)-circ(ixC^S,idim1)
+      do idim2=1,ndim
+        ixA^L=ixC^L-kr(idim2,^D);
+        do idir=sdim,3 ! Direction of line integral
+          ! Assemble indices
+          if(lvc(idim1,idim2,idir)==1) then
+            ! Add line integrals in direction idir
+            circ(ixC^S,idim1)=circ(ixC^S,idim1)&
+                             +(fE(ixC^S,idir)&
+                              -fE(ixA^S,idir))
+          else if(lvc(idim1,idim2,idir)==-1) then
+            ! Add line integrals in direction idir
+            circ(ixC^S,idim1)=circ(ixC^S,idim1)&
+                             -(fE(ixC^S,idir)&
+                              -fE(ixA^S,idir))
+          end if
+        end do
+      end do
+     {do ix^DB=ixCmin^DB,ixCmax^DB\}
+        ! Divide by the area of the face to get dB/dt
+        if(s%surfaceC(ix^D,idim1) > smalldouble) then
+          ! Time update cell-face magnetic field component
+          bfaces(ix^D,idim1)=bfaces(ix^D,idim1)-circ(ix^D,idim1)/s%surfaceC(ix^D,idim1)
+        end if
+     {end do\}
     end do
 
     end associate
 
-  end subroutine update_faces_average
+  end subroutine twofl_update_faces_average
 
   !> update faces using UCT contact mode by Gardiner and Stone 2005 JCP 205, 509
-  subroutine update_faces_contact(ixI^L,ixO^L,qt,qdt,wp,fC,fE,sCT,s,vcts)
+  subroutine twofl_update_faces_contact(ixI^L,ixO^L,qt,qdt,wp,fC,fE,sCT,s,vcts)
     use mod_global_parameters
     use mod_usr_methods
+    use mod_geometry
 
     integer, intent(in)                :: ixI^L, ixO^L
     double precision, intent(in)       :: qt, qdt
@@ -5694,114 +5759,135 @@ contains
     double precision                   :: circ(ixI^S,1:ndim)
     ! electric field at cell centers
     double precision                   :: ECC(ixI^S,sdim:3)
+    double precision                   :: Ein(ixI^S,sdim:3)
     ! gradient of E at left and right side of a cell face
     double precision                   :: EL(ixI^S),ER(ixI^S)
     ! gradient of E at left and right side of a cell corner
-    double precision                   :: ELC(ixI^S),ERC(ixI^S)
+    double precision                   :: ELC,ERC
     ! non-ideal electric field on cell edges
     double precision, dimension(ixI^S,sdim:3) :: E_resi, E_ambi
-    ! total magnetic field at cell centers
-    double precision                   :: Btot(ixI^S,1:ndim)
-    integer                            :: hxC^L,ixC^L,jxC^L,ixA^L,ixB^L
-    integer                            :: idim1,idim2,idir,iwdim1,iwdim2
+    ! current on cell edges
+    double precision :: jce(ixI^S,sdim:3)
+    ! location at cell faces
+    double precision :: xs(ixGs^T,1:ndim)
+    double precision :: gradi(ixGs^T)
+    integer :: ixC^L,ixA^L
+    integer :: idim1,idim2,idir,iwdim1,iwdim2,ix^D,i1kr^D,i2kr^D
 
-    associate(bfaces=>s%ws,x=>s%x,w=>s%w,vnorm=>vcts%vnorm)
-
-    if(B0field) then
-      Btot(ixI^S,1:ndim)=wp(ixI^S,mag(1:ndim))+block%B0(ixI^S,1:ndim,0)
-    else
-      Btot(ixI^S,1:ndim)=wp(ixI^S,mag(1:ndim))
-    end if
-    ECC=0.d0
-    ! Calculate electric field at cell centers
-    do idim1=1,ndim; do idim2=1,ndim; do idir=sdim,3
-      if(lvc(idim1,idim2,idir)==1)then
-         ECC(ixI^S,idir)=ECC(ixI^S,idir)+Btot(ixI^S,idim1)*wp(ixI^S,mom_c(idim2))
-      else if(lvc(idim1,idim2,idir)==-1) then
-         ECC(ixI^S,idir)=ECC(ixI^S,idir)-Btot(ixI^S,idim1)*wp(ixI^S,mom_c(idim2))
-      endif
-    enddo; enddo; enddo
+    associate(bfaces=>s%ws,x=>s%x,w=>s%w,vnorm=>vcts%vnorm,wCTs=>sCT%ws)
 
     ! if there is resistivity, get eta J
-    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,sCT,s,E_resi)
+    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,wp,sCT,s,E_resi)
+
+    if(B0field) then
+     {do ix^DB=ixImin^DB,ixImax^DB\}
+        ! Calculate electric field at cell centers
+       {^IFTHREED
+        ECC(ix^D,1)=(wp(ix^D,b2_)+block%B0(ix^D,2,0))*wp(ix^D,m3_)-(wp(ix^D,b3_)+block%B0(ix^D,3,0))*wp(ix^D,m2_)
+        ECC(ix^D,2)=(wp(ix^D,b3_)+block%B0(ix^D,3,0))*wp(ix^D,m1_)-(wp(ix^D,b1_)+block%B0(ix^D,1,0))*wp(ix^D,m3_)
+        ECC(ix^D,3)=(wp(ix^D,b1_)+block%B0(ix^D,1,0))*wp(ix^D,m2_)-(wp(ix^D,b2_)+block%B0(ix^D,2,0))*wp(ix^D,m1_)
+       }
+       {^IFTWOD
+        ECC(ix^D,3)=wp(ix^D,b1_)*wp(ix^D,m2_)-wp(ix^D,b2_)*wp(ix^D,m1_)
+       }
+       {^IFONED
+        ECC(ix^D,3)=0.d0
+       }
+     {end do\}
+    else
+     {do ix^DB=ixImin^DB,ixImax^DB\}
+        ! Calculate electric field at cell centers
+       {^IFTHREED
+        ECC(ix^D,1)=wp(ix^D,b2_)*wp(ix^D,m3_)-wp(ix^D,b3_)*wp(ix^D,m2_)
+        ECC(ix^D,2)=wp(ix^D,b3_)*wp(ix^D,m1_)-wp(ix^D,b1_)*wp(ix^D,m3_)
+        ECC(ix^D,3)=wp(ix^D,b1_)*wp(ix^D,m2_)-wp(ix^D,b2_)*wp(ix^D,m1_)
+       }
+       {^IFTWOD
+        ECC(ix^D,3)=wp(ix^D,b1_)*wp(ix^D,m2_)-wp(ix^D,b2_)*wp(ix^D,m1_)
+       }
+       {^IFONED
+        ECC(ix^D,3)=0.d0
+       }
+     {end do\}
+    end if
+
     ! Calculate contribution to FEM of each edge,
     ! that is, estimate value of line integral of
     ! electric field in the positive idir direction.
-    fE=zero
     ! evaluate electric field along cell edges according to equation (41)
-    do idim1=1,ndim 
+    do idim1=1,ndim
       iwdim1 = mag(idim1)
+      i1kr^D=kr(idim1,^D);
       do idim2=1,ndim
         iwdim2 = mag(idim2)
+        i2kr^D=kr(idim2,^D);
         do idir=sdim,3 ! Direction of line integral
           ! Allow only even permutations
           if (lvc(idim1,idim2,idir)==1) then
             ixCmax^D=ixOmax^D;
             ixCmin^D=ixOmin^D+kr(idir,^D)-1;
             ! Assemble indices
-            jxC^L=ixC^L+kr(idim1,^D);
-            hxC^L=ixC^L+kr(idim2,^D);
             ! average cell-face electric field to cell edges
-            fE(ixC^S,idir)=quarter*&
-            (fC(ixC^S,iwdim1,idim2)+fC(jxC^S,iwdim1,idim2)&
-            -fC(ixC^S,iwdim2,idim1)-fC(hxC^S,iwdim2,idim1))
-
+           {do ix^DB=ixCmin^DB,ixCmax^DB\}
+              fE(ix^D,idir)=quarter*&
+              (fC(ix^D,iwdim1,idim2)+fC({ix^D+i1kr^D},iwdim1,idim2)&
+              -fC(ix^D,iwdim2,idim1)-fC({ix^D+i2kr^D},iwdim2,idim1))
+           {end do\}
             ! add slope in idim2 direction from equation (50)
             ixAmin^D=ixCmin^D;
-            ixAmax^D=ixCmax^D+kr(idim1,^D);
-            EL(ixA^S)=fC(ixA^S,iwdim1,idim2)-ECC(ixA^S,idir)
-            hxC^L=ixA^L+kr(idim2,^D);
-            ER(ixA^S)=fC(ixA^S,iwdim1,idim2)-ECC(hxC^S,idir)
-            where(vnorm(ixC^S,idim1)>0.d0)
-              ELC(ixC^S)=EL(ixC^S)
-            else where(vnorm(ixC^S,idim1)<0.d0)
-              ELC(ixC^S)=EL(jxC^S)
-            else where
-              ELC(ixC^S)=0.5d0*(EL(ixC^S)+EL(jxC^S))
-            end where
-            hxC^L=ixC^L+kr(idim2,^D);
-            where(vnorm(hxC^S,idim1)>0.d0)
-              ERC(ixC^S)=ER(ixC^S)
-            else where(vnorm(hxC^S,idim1)<0.d0)
-              ERC(ixC^S)=ER(jxC^S)
-            else where
-              ERC(ixC^S)=0.5d0*(ER(ixC^S)+ER(jxC^S))
-            end where
-            fE(ixC^S,idir)=fE(ixC^S,idir)+0.25d0*(ELC(ixC^S)+ERC(ixC^S))
+            ixAmax^D=ixCmax^D+i1kr^D;
+           {do ix^DB=ixAmin^DB,ixAmax^DB\}
+              EL(ix^D)=fC(ix^D,iwdim1,idim2)-ECC(ix^D,idir)
+              ER(ix^D)=fC(ix^D,iwdim1,idim2)-ECC({ix^D+i2kr^D},idir)
+           {end do\}
+           {!dir$ ivdep
+            do ix^DB=ixCmin^DB,ixCmax^DB\}
+              if(vnorm(ix^D,idim1)>0.d0) then
+                ELC=EL(ix^D)
+              else if(vnorm(ix^D,idim1)<0.d0) then
+                ELC=EL({ix^D+i1kr^D})
+              else
+                ELC=0.5d0*(EL(ix^D)+EL({ix^D+i1kr^D}))
+              end if
+              if(vnorm({ix^D+i2kr^D},idim1)>0.d0) then
+                ERC=ER(ix^D)
+              else if(vnorm({ix^D+i2kr^D},idim1)<0.d0) then
+                ERC=ER({ix^D+i1kr^D})
+              else
+                ERC=0.5d0*(ER(ix^D)+ER({ix^D+i1kr^D}))
+              end if
+              fE(ix^D,idir)=fE(ix^D,idir)+0.25d0*(ELC+ERC)
+           {end do\}
 
             ! add slope in idim1 direction from equation (50)
-            jxC^L=ixC^L+kr(idim2,^D);
             ixAmin^D=ixCmin^D;
-            ixAmax^D=ixCmax^D+kr(idim2,^D);
-            EL(ixA^S)=-fC(ixA^S,iwdim2,idim1)-ECC(ixA^S,idir)
-            hxC^L=ixA^L+kr(idim1,^D);
-            ER(ixA^S)=-fC(ixA^S,iwdim2,idim1)-ECC(hxC^S,idir)
-            where(vnorm(ixC^S,idim2)>0.d0)
-              ELC(ixC^S)=EL(ixC^S)
-            else where(vnorm(ixC^S,idim2)<0.d0)
-              ELC(ixC^S)=EL(jxC^S)
-            else where
-              ELC(ixC^S)=0.5d0*(EL(ixC^S)+EL(jxC^S))
-            end where
-            hxC^L=ixC^L+kr(idim1,^D);
-            where(vnorm(hxC^S,idim2)>0.d0)
-              ERC(ixC^S)=ER(ixC^S)
-            else where(vnorm(hxC^S,idim2)<0.d0)
-              ERC(ixC^S)=ER(jxC^S)
-            else where
-              ERC(ixC^S)=0.5d0*(ER(ixC^S)+ER(jxC^S))
-            end where
-            fE(ixC^S,idir)=fE(ixC^S,idir)+0.25d0*(ELC(ixC^S)+ERC(ixC^S))
-
-            ! add current component of electric field at cell edges E=-vxB+eta J
-            if(twofl_eta/=zero) fE(ixC^S,idir)=fE(ixC^S,idir)+E_resi(ixC^S,idir)
-            ! times time step and edge length 
-            fE(ixC^S,idir)=fE(ixC^S,idir)*qdt*s%dsC(ixC^S,idir)
-            if (.not.slab) then
-              where(abs(x(ixC^S,r_)+half*dxlevel(r_))<1.0d-9)
-                fE(ixC^S,idir)=zero
-              end where
-            end if
+            ixAmax^D=ixCmax^D+i2kr^D;
+           {do ix^DB=ixAmin^DB,ixAmax^DB\}
+              EL(ix^D)=-fC(ix^D,iwdim2,idim1)-ECC(ix^D,idir)
+              ER(ix^D)=-fC(ix^D,iwdim2,idim1)-ECC({ix^D+i1kr^D},idir)
+           {end do\}
+           {!dir$ ivdep
+            do ix^DB=ixCmin^DB,ixCmax^DB\}
+              if(vnorm(ix^D,idim2)>0.d0) then
+                ELC=EL(ix^D)
+              else if(vnorm(ix^D,idim2)<0.d0) then
+                ELC=EL({ix^D+i2kr^D})
+              else
+                ELC=0.5d0*(EL(ix^D)+EL({ix^D+i2kr^D}))
+              end if
+              if(vnorm({ix^D+i1kr^D},idim2)>0.d0) then
+                ERC=ER(ix^D)
+              else if(vnorm({ix^D+i1kr^D},idim2)<0.d0) then
+                ERC=ER({ix^D+i2kr^D})
+              else
+                ERC=0.5d0*(ER(ix^D)+ER({ix^D+i2kr^D}))
+              end if
+              fE(ix^D,idir)=fE(ix^D,idir)+0.25d0*(ELC+ERC)
+              ! add resistive electric field at cell edges E=-vxB+eta J
+              if(twofl_eta/=zero) fE(ix^D,idir)=fE(ix^D,idir)+E_resi(ix^D,idir)
+              ! times time step and edge length
+              fE(ix^D,idir)=fE(ix^D,idir)*qdt*s%dsC(ix^D,idir)
+           {end do\}
           end if
         end do
       end do
@@ -5814,60 +5900,66 @@ contains
     circ(ixI^S,1:ndim)=zero
 
     ! Calculate circulation on each face
-    do idim1=1,ndim ! Coordinate perpendicular to face 
+    do idim1=1,ndim ! Coordinate perpendicular to face
       ixCmax^D=ixOmax^D;
       ixCmin^D=ixOmin^D-kr(idim1,^D);
       do idim2=1,ndim
+        ixA^L=ixC^L-kr(idim2,^D);
         do idir=sdim,3 ! Direction of line integral
           ! Assemble indices
-          hxC^L=ixC^L-kr(idim2,^D);
-          ! Add line integrals in direction idir
-          circ(ixC^S,idim1)=circ(ixC^S,idim1)&
-                           +lvc(idim1,idim2,idir)&
-                           *(fE(ixC^S,idir)&
-                            -fE(hxC^S,idir))
+          if(lvc(idim1,idim2,idir)==1) then
+            ! Add line integrals in direction idir
+            circ(ixC^S,idim1)=circ(ixC^S,idim1)&
+                             +(fE(ixC^S,idir)&
+                              -fE(ixA^S,idir))
+          else if(lvc(idim1,idim2,idir)==-1) then
+            ! Add line integrals in direction idir
+            circ(ixC^S,idim1)=circ(ixC^S,idim1)&
+                             -(fE(ixC^S,idir)&
+                              -fE(ixA^S,idir))
+          end if
         end do
       end do
-      ! Divide by the area of the face to get dB/dt
-      ixCmax^D=ixOmax^D;
-      ixCmin^D=ixOmin^D-kr(idim1,^D);
-      where(s%surfaceC(ixC^S,idim1) > 1.0d-9*s%dvolume(ixC^S))
-        circ(ixC^S,idim1)=circ(ixC^S,idim1)/s%surfaceC(ixC^S,idim1)
-      elsewhere
-        circ(ixC^S,idim1)=zero
-      end where
-      ! Time update cell-face magnetic field component
-      bfaces(ixC^S,idim1)=bfaces(ixC^S,idim1)-circ(ixC^S,idim1)
+     {do ix^DB=ixCmin^DB,ixCmax^DB\}
+        ! Divide by the area of the face to get dB/dt
+        if(s%surfaceC(ix^D,idim1) > smalldouble) then
+          ! Time update cell-face magnetic field component
+          bfaces(ix^D,idim1)=bfaces(ix^D,idim1)-circ(ix^D,idim1)/s%surfaceC(ix^D,idim1)
+        end if
+     {end do\}
     end do
 
     end associate
 
-  end subroutine update_faces_contact
+  end subroutine twofl_update_faces_contact
 
   !> update faces
-  subroutine update_faces_hll(ixI^L,ixO^L,qt,qdt,fE,sCT,s,vcts)
+  subroutine twofl_update_faces_hll(ixI^L,ixO^L,qt,qdt,wp,fC,fE,sCT,s,vcts)
     use mod_global_parameters
-    use mod_constrained_transport
     use mod_usr_methods
+    use mod_constrained_transport
 
     integer, intent(in)                :: ixI^L, ixO^L
     double precision, intent(in)       :: qt, qdt
-    double precision, intent(inout)    :: fE(ixI^S,sdim:3)
+    ! cell-center primitive variables
+    double precision, intent(in)       :: wp(ixI^S,1:nw)
     type(state)                        :: sCT, s
     type(ct_velocity)                  :: vcts
+    double precision, intent(in)       :: fC(ixI^S,1:nwflux,1:ndim)
+    double precision, intent(inout)    :: fE(ixI^S,sdim:3)
 
     double precision                   :: vtilL(ixI^S,2)
     double precision                   :: vtilR(ixI^S,2)
     double precision                   :: bfacetot(ixI^S,ndim)
-    double precision                   :: btilL(s%ixGs^S,ndim)
-    double precision                   :: btilR(s%ixGs^S,ndim)
+    double precision                   :: btilL(ixI^S,ndim)
+    double precision                   :: btilR(ixI^S,ndim)
     double precision                   :: cp(ixI^S,2)
     double precision                   :: cm(ixI^S,2)
     double precision                   :: circ(ixI^S,1:ndim)
     ! non-ideal electric field on cell edges
     double precision, dimension(ixI^S,sdim:3) :: E_resi, E_ambi
     integer                            :: hxC^L,ixC^L,ixCp^L,jxC^L,ixCm^L
-    integer                            :: idim1,idim2,idir
+    integer                            :: idim1,idim2,idir,ix^D
 
     associate(bfaces=>s%ws,bfacesCT=>sCT%ws,x=>s%x,vbarC=>vcts%vbarC,cbarmin=>vcts%cbarmin,&
       cbarmax=>vcts%cbarmax)
@@ -5883,8 +5975,7 @@ contains
     ! idim2: directions in which we perform the reconstruction
 
     ! if there is resistivity, get eta J
-    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,sCT,s,E_resi)
-    fE=zero
+    if(twofl_eta/=zero) call get_resistive_electric_field(ixI^L,ixO^L,wp,sCT,s,E_resi)
 
     do idir=sdim,3
       ! Indices
@@ -5948,7 +6039,7 @@ contains
                      - cp(ixC^S,2)*cm(ixC^S,2)*(btilR(ixC^S,idim1)-btilL(ixC^S,idim1)))&
                      /(cp(ixC^S,2)+cm(ixC^S,2))
 
-      ! add current component of electric field at cell edges E=-vxB+eta J
+      ! add resistive electric field at cell edges E=-vxB+eta J
       if(twofl_eta/=zero) fE(ixC^S,idir)=fE(ixC^S,idir)+E_resi(ixC^S,idir)
       fE(ixC^S,idir)=qdt*s%dsC(ixC^S,idir)*fE(ixC^S,idir)
 
@@ -5967,46 +6058,43 @@ contains
     circ(ixI^S,1:ndim)=zero
 
     ! Calculate circulation on each face: interal(fE dot dl)
-
-    do idim1=1,ndim ! Coordinate perpendicular to face 
+    do idim1=1,ndim ! Coordinate perpendicular to face
       ixCmax^D=ixOmax^D;
       ixCmin^D=ixOmin^D-kr(idim1,^D);
       do idim2=1,ndim
         do idir=sdim,3 ! Direction of line integral
           ! Assemble indices
-          hxC^L=ixC^L-kr(idim2,^D);
-          ! Add line integrals in direction idir
-          circ(ixC^S,idim1)=circ(ixC^S,idim1)&
-                           +lvc(idim1,idim2,idir)&
-                           *(fE(ixC^S,idir)&
-                            -fE(hxC^S,idir))
+          if(lvc(idim1,idim2,idir)/=0) then
+            hxC^L=ixC^L-kr(idim2,^D);
+            ! Add line integrals in direction idir
+            circ(ixC^S,idim1)=circ(ixC^S,idim1)&
+                             +lvc(idim1,idim2,idir)&
+                             *(fE(ixC^S,idir)&
+                              -fE(hxC^S,idir))
+          end if
         end do
       end do
-    end do
-
-    ! Divide by the area of the face to get dB/dt
-    do idim1=1,ndim
-      ixCmax^D=ixOmax^D;
-      ixCmin^D=ixOmin^D-kr(idim1,^D);
-      where(s%surfaceC(ixC^S,idim1) > 1.0d-9*s%dvolume(ixC^S))
-        circ(ixC^S,idim1)=circ(ixC^S,idim1)/s%surfaceC(ixC^S,idim1)
-      elsewhere
-        circ(ixC^S,idim1)=zero
-      end where
-      ! Time update
-      bfaces(ixC^S,idim1)=bfaces(ixC^S,idim1)-circ(ixC^S,idim1)
+     {do ix^DB=ixCmin^DB,ixCmax^DB\}
+        ! Divide by the area of the face to get dB/dt
+        if(s%surfaceC(ix^D,idim1) > smalldouble) then
+          ! Time update cell-face magnetic field component
+          bfaces(ix^D,idim1)=bfaces(ix^D,idim1)-circ(ix^D,idim1)/s%surfaceC(ix^D,idim1)
+        end if
+     {end do\}
     end do
 
     end associate
-  end subroutine update_faces_hll
+  end subroutine twofl_update_faces_hll
 
   !> calculate eta J at cell edges
-  subroutine get_resistive_electric_field(ixI^L,ixO^L,sCT,s,jce)
+  subroutine get_resistive_electric_field(ixI^L,ixO^L,wp,sCT,s,jce)
     use mod_global_parameters
     use mod_usr_methods
     use mod_geometry
 
     integer, intent(in)                :: ixI^L, ixO^L
+    ! cell-center primitive variables
+    double precision, intent(in)       :: wp(ixI^S,1:nw)
     type(state), intent(in)            :: sCT, s
     ! current on cell edges
     double precision :: jce(ixI^S,sdim:3)
@@ -6023,7 +6111,7 @@ contains
     associate(x=>s%x,dx=>s%dx,w=>s%w,wCT=>sCT%w,wCTs=>sCT%ws)
     ! calculate current density at cell edges
     jce=0.d0
-    do idim1=1,ndim 
+    do idim1=1,ndim
       do idim2=1,ndim
         do idir=sdim,3
           if (lvc(idim1,idim2,idir)==0) cycle
@@ -6034,7 +6122,7 @@ contains
           ! current at transverse faces
           xs(ixB^S,:)=x(ixB^S,:)
           xs(ixB^S,idim2)=x(ixB^S,idim2)+half*dx(ixB^S,idim2)
-          call gradientx(wCTs(ixGs^T,idim2),xs,ixGs^LL,ixC^L,idim1,gradi,.true.)
+          call gradientF(wCTs(ixGs^T,idim2),xs,ixGs^LL,ixC^L,idim1,gradi,2)
           if (lvc(idim1,idim2,idir)==1) then
             jce(ixC^S,idir)=jce(ixC^S,idir)+gradi(ixC^S)
           else
@@ -6049,7 +6137,7 @@ contains
     else
       ixA^L=ixO^L^LADD1;
       call get_current(wCT,ixI^L,ixA^L,idirmin,jcc)
-      call usr_special_resistivity(wCT,ixI^L,ixA^L,idirmin,x,jcc,eta)
+      call usr_special_resistivity(wp,ixI^L,ixA^L,idirmin,x,jcc,eta)
       ! calcuate eta on cell edges
       do idir=sdim,3
         ixCmax^D=ixOmax^D;
@@ -6063,7 +6151,7 @@ contains
        {end do\}
         jcc(ixC^S,idir)=jcc(ixC^S,idir)*0.25d0
         jce(ixC^S,idir)=jce(ixC^S,idir)*jcc(ixC^S,idir)
-      enddo
+      end do
     end if
 
     end associate

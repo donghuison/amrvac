@@ -12,16 +12,26 @@ module mod_physics
 
   double precision :: phys_gamma=5.d0/3.d0
 
-  !> String describing the physics type of the simulation
-  character(len=name_len) :: physics_type = ""
-
   !> To use wider stencils in flux calculations. A value of 1 will extend it by
   !> one cell in both directions, in any dimension
   integer :: phys_wider_stencil = 0
 
-  !> Whether the physics routines require diagonal ghost cells, for example for
-  !> computing a curl.
-  logical :: phys_req_diagonal = .true.
+  !> Array per direction per variable, which can be used to specify that certain
+  !> fluxes have to be treated differently
+  integer, allocatable :: flux_type(:, :)
+
+  !> Indicates a normal flux
+  integer, parameter   :: flux_default        = 0
+  !> Indicates the flux should be treated with tvdlf
+  integer, parameter   :: flux_tvdlf          = 1
+  !> Indicates dissipation should be omitted
+  integer, parameter   :: flux_no_dissipation = 2
+  !> Indicates the flux should be specially treated
+  integer, parameter   :: flux_special        = 3
+  !> Indicates the flux should be treated with hll
+  integer, parameter   :: flux_hll        = 4
+  !> extra ghost cells in the transverse dimensions for fluxes of CT
+  integer :: transverse_ghost_cells = 0
 
   !> Solve energy equation or not
   logical :: phys_energy=.false.
@@ -38,20 +48,8 @@ module mod_physics
   !> if equilibrium pressure is splitted
   logical :: phys_equi_pe=.false.
 
-  !> Array per direction per variable, which can be used to specify that certain
-  !> fluxes have to be treated differently
-  integer, allocatable :: flux_type(:, :)
-
-  !> Indicates a normal flux
-  integer, parameter   :: flux_default        = 0
-  !> Indicates the flux should be treated with tvdlf
-  integer, parameter   :: flux_tvdlf          = 1
-  !> Indicates dissipation should be omitted
-  integer, parameter   :: flux_no_dissipation = 2
-  !> Indicates the flux should be specially treated
-  integer, parameter   :: flux_special        = 3
-  !> Indicates the flux should be treated with hll
-  integer, parameter   :: flux_hll        = 4
+  !> String describing the physics type of the simulation
+  character(len=name_len) :: physics_type = ""
 
   procedure(sub_check_params), pointer    :: phys_check_params           => null()
   procedure(sub_set_mg_bounds), pointer   :: phys_set_mg_bounds          => null()
@@ -66,6 +64,7 @@ module mod_physics
   procedure(sub_get_cbounds), pointer     :: phys_get_cbounds            => null()
   procedure(sub_get_flux), pointer        :: phys_get_flux               => null()
   procedure(sub_get_v), pointer           :: phys_get_v                  => null()
+  procedure(sub_get_rho), pointer         :: phys_get_rho                => null()
   procedure(sub_get_dt), pointer          :: phys_get_dt                 => null()
   procedure(sub_add_source_geom), pointer :: phys_add_source_geom        => null()
   procedure(sub_add_source), pointer      :: phys_add_source             => null()
@@ -153,12 +152,17 @@ module mod_physics
 
      subroutine sub_get_v(w,x,ixI^L,ixO^L,v)
        use mod_global_parameters
-
        integer, intent(in)           :: ixI^L, ixO^L
        double precision, intent(in)  :: w(ixI^S,nw), x(ixI^S,1:^ND)
        double precision, intent(out) :: v(ixI^S,1:ndir)
-
      end subroutine sub_get_v
+
+     subroutine sub_get_rho(w,x,ixI^L,ixO^L,rho)
+       use mod_global_parameters
+       integer, intent(in)           :: ixI^L, ixO^L
+       double precision, intent(in)  :: w(ixI^S,nw), x(ixI^S,1:^ND)
+       double precision, intent(out) :: rho(ixI^S)
+     end subroutine sub_get_rho
 
      subroutine sub_get_H_speed(wprim,x,ixI^L,ixO^L,idim,Hspeed)
        use mod_global_parameters
@@ -189,11 +193,11 @@ module mod_physics
        double precision, intent(out)   :: f(ixI^S, nwflux)
      end subroutine sub_get_flux
 
-     subroutine sub_add_source_geom(qdt, dtfactor, ixI^L, ixO^L, wCT, w, x)
+     subroutine sub_add_source_geom(qdt, dtfactor, ixI^L, ixO^L, wCT, wprim, w, x)
        use mod_global_parameters
        integer, intent(in)             :: ixI^L, ixO^L
        double precision, intent(in)    :: qdt, dtfactor, x(ixI^S, 1:^ND)
-       double precision, intent(inout) :: wCT(ixI^S, 1:nw), w(ixI^S, 1:nw)
+       double precision, intent(inout) :: wCT(ixI^S, 1:nw), wprim(ixI^S, 1:nw), w(ixI^S, 1:nw)
      end subroutine sub_add_source_geom
 
      subroutine sub_add_source(qdt, dtfactor, ixI^L, ixO^L, wCT, wCTprim, w, x, &
@@ -481,11 +485,11 @@ contains
        call mpistop("Error: entered dummy_get_a2max")
   end subroutine dummy_get_a2max
 
-  subroutine dummy_add_source_geom(qdt, dtfactor, ixI^L, ixO^L, wCT, w, x)
+  subroutine dummy_add_source_geom(qdt, dtfactor, ixI^L, ixO^L, wCT, wprim, w, x)
     use mod_global_parameters
     integer, intent(in)             :: ixI^L, ixO^L
     double precision, intent(in)    :: qdt, dtfactor, x(ixI^S, 1:^ND)
-    double precision, intent(inout) :: wCT(ixI^S, 1:nw), w(ixI^S, 1:nw)
+    double precision, intent(inout) :: wCT(ixI^S, 1:nw), wprim(ixI^S,1:nw),w(ixI^S, 1:nw)
   end subroutine dummy_add_source_geom
 
   subroutine dummy_add_source(qdt, dtfactor, ixI^L, ixO^L, wCT, wCTprim, w, x, &

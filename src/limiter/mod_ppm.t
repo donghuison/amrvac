@@ -120,15 +120,14 @@ contains
     double precision,dimension(ixI^S,1:nwflux)  :: wMin,wMax,tmp
     double precision,dimension(ixI^S) :: aa, ab, ac, ki
 
+    double precision, parameter :: betamin=0.75d0, betamax=0.85d0,&
+         Zmin=0.25d0, Zmax=0.75d0,&
+         eta1=20.0d0,eta2=0.05d0,eps=0.01d0,kappa=0.1d0
     integer   :: lxC^L,lxL^L,lxR^L
     integer   :: ixLL^L,ixL^L,ixO^L,ixR^L,ixRR^L,ixOL^L,ixOR^L
     integer   :: hxL^L,hxC^L,hxR^L
     integer   :: kxLL^L,kxL^L,kxC^L,kxR^L,kxRR^L
     integer   :: iw, idimss
-
-    double precision, parameter :: betamin=0.75d0, betamax=0.85d0,&
-         Zmin=0.25d0, Zmax=0.75d0,&
-         eta1=20.0d0,eta2=0.05d0,eps=0.01d0,kappa=0.1d0
 
     ixOmin^D=ixmin^D-kr(idims,^D);ixOmax^D=ixmax^D+kr(idims,^D);!ixO[ixMmin-1,ixMmax+1]
     ixOLmin^D=ixOmin^D-kr(idims,^D);ixOLmax^D=ixOmax^D;         !ixOL[ixMmin-2,ixMmax+1]
@@ -140,7 +139,7 @@ contains
     hxL^L=hxC^L-kr(idims,^D);           ! hxL = [ixMmin-2,ixMmax-1]
     hxR^L=hxC^L+kr(idims,^D);           ! hxR = [ixMmin,ixMmax+1]
 
-    kxCmin^D=ixLmin^D-1; kxCmax^D=ixRmax^D; ! kxC=[iMmin-3,ixMmax+2]
+    kxCmin^D=ixLmin^D-kr(idims,^D); kxCmax^D=ixRmax^D; ! kxC=[iMmin-3,ixMmax+2]
     kxR^L=kxC^L+kr(idims,^D);              ! kxR=[iMmin-2,ixMmax+3]
 
     lxCmin^D=ixOmin^D-kr(idims,^D);lxCmax^D=ixOmax^D+kr(idims,^D);! lxC=[iMmin-2,ixMmax+2]
