@@ -34,3 +34,9 @@ doc/html/*
 /CLAUDE.md
 .DS_Store
 /.claude/
+
+/.codex/
+/.omx/
+AGENTS.md
+tests/mhd/lfff_extrapolation_3D/README.md
+tests/mhd/solar_atmosphere_3D/README.md

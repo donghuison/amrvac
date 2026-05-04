@@ -44,7 +44,8 @@ def regrid_amr_data(dataset, nbprocs):
                                 processes=nbprocs)
 
     # Execute multiprocessing pool
-    blocks_regridded = np.array(pool.starmap(_interpolate_block, block_iterable))
+    # Mixed AMR levels yield mixed block shapes here, so keep the list form.
+    blocks_regridded = pool.starmap(_interpolate_block, block_iterable)
     pool.close()
     pool.join()
     _print_progress(100, 100)
